@@ -28,20 +28,27 @@ class FlightAgent:
         self.telemetry_data = telemetry_data
         self.analyzer = analyzer
         
-        # Initialize memory manager with configurable window size
-        self.memory_manager = EnhancedMemoryManager(
-            session_id=session_id,
-            db_session=db_session,
-            window_size=memory_window_size
-        )
+        # Ensure OPENAI_API_KEY is set and use it directly
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            print("ERROR: OPENAI_API_KEY environment variable not set!")
+            openai_api_key = "sk-1234567890abcdefghijklmnopqrstuvwxyz"  # Placeholder for error message
         
-        # Initialize chat model with GPT-4o
+        # Initialize chat model with GPT-4o FIRST
         self.chat = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o"),
             temperature=0,
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            openai_api_key=openai_api_key,  # Use the variable directly
             max_retries=2,
             request_timeout=30  # 30 seconds timeout to avoid hanging
+        )
+
+        # Initialize memory manager with configurable window size, passing the LLM
+        self.memory_manager = EnhancedMemoryManager(
+            session_id=session_id,
+            db_session=db_session,
+            window_size=memory_window_size,
+            llm=self.chat  # Pass the initialized LLM
         )
         
         # Advanced ReAct system prompt with examples
@@ -265,7 +272,7 @@ ANSWER:
                 # Extract query reasoning
                 query_reasoning = context.get("query_reasoning", "No specific reasoning available.")
                 print(f"Query reasoning: {query_reasoning[:100]}...")
-                
+            
                 # Perform flight analysis with timeout protection
                 print("Performing flight analysis...")
                 try:
@@ -284,7 +291,7 @@ ANSWER:
                     print(f"FLIGHT ANALYSIS ERROR TRACEBACK: {traceback.format_exc()}")
                     # If analysis fails for any reason, propagate the error
                     raise
-                
+            
                 # Prepare analysis_data for the API JSON response
                 analysis_data_for_api = {
                     "type": "Flight Analysis",
@@ -310,7 +317,7 @@ ANSWER:
                             analysis_data_for_api["anomalies"] = "No anomalies detected in the flight log."
                     else:
                         analysis_data_for_api["anomalies"] = "Anomaly detection data not available or not processed."
-                
+            
                 # Process memory recall with proper error handling
                 print("Processing memory recall...")
                 memory_recall = ""
@@ -323,11 +330,11 @@ ANSWER:
                     print(f"MEMORY RECALL ERROR TRACEBACK: {traceback.format_exc()}")
                     # If memory recall fails, continue with empty recall
                     memory_recall = ""
-                
+            
                 # Format chat history from the summary buffer memory
                 chat_history = context.get("chat_history", [])
                 print(f"Retrieved {len(chat_history)} chat history items")
-                
+            
                 # Generate response using ChatOpenAI with timeout protection
                 print("Generating response using chat model...")
                 
@@ -472,7 +479,7 @@ ANSWER:
             # Build metrics summary with accurate altitude data
             try:
                 temp_metrics_parts = []
-                
+            
                 # CRITICAL FIX: Get altitude data directly from reliable _analyze_altitude method
                 alt_analysis = self.analyzer._analyze_altitude()
                 if alt_analysis and "statistics" in alt_analysis:
@@ -512,10 +519,10 @@ ANSWER:
                             speed_data = flight_metrics[field_name]
                             max_vel = speed_data.get('max')
                             mean_vel = speed_data.get('mean')
-                            if max_vel is not None: temp_metrics_parts.append(f"Max Speed: {max_vel:.1f} m/s")
-                            if mean_vel is not None: temp_metrics_parts.append(f"Avg Speed: {mean_vel:.1f} m/s")
-                            vfr_hud_speed = True
-                            break
+                        if max_vel is not None: temp_metrics_parts.append(f"Max Speed: {max_vel:.1f} m/s")
+                        if mean_vel is not None: temp_metrics_parts.append(f"Avg Speed: {mean_vel:.1f} m/s")
+                        vfr_hud_speed = True
+                        break
                 
                 # Find battery-related fields if not already found
                 battery_field = None
@@ -524,9 +531,10 @@ ANSWER:
                         battery_field = field_name
                         if isinstance(flight_metrics[battery_field], dict):
                             bat_data = flight_metrics[battery_field]
-                            if 'max' in bat_data: temp_metrics_parts.append(f"Battery Level: {bat_data['max']:.0f}%")
+                            if 'max' in bat_data: 
+                                temp_metrics_parts.append(f"Battery Level: {bat_data['max']:.0f}%")
                             break
-                            
+
                 if temp_metrics_parts:
                     flight_data_for_prompt["key_metrics"] = "; ".join(temp_metrics_parts)
                 else:
@@ -551,7 +559,7 @@ ANSWER:
             except Exception as anomaly_err:
                 print(f"Error getting anomaly summary: {str(anomaly_err)}")
                 flight_data_for_prompt["anomalies"] = "Error retrieving anomalies."
-                
+            
         except Exception as e:
             print(f"Error building flight data summary: {str(e)}")
             import traceback

@@ -59,6 +59,31 @@ This is the backend service for the UAV Logger application, providing telemetry 
 
 ## Environment Variables
 
+This project requires environment variables to be set for proper operation. Create a `.env` file in the `backend/` directory with the following variables:
+
+```
+# OpenAI API Configuration - REQUIRED
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o
+
+# Server Configuration
+HOST=0.0.0.0
+PORT=8000
+
+# CORS Configuration
+ALLOWED_ORIGINS=http://localhost:8080
+ALLOWED_METHODS=GET,POST,PUT,DELETE
+ALLOWED_HEADERS=Content-Type,Accept,Origin,X-Requested-With
+CORS_MAX_AGE=3600
+
+# Application Settings
+TEMP_UPLOAD_DIR=temp
+```
+
+The `OPENAI_API_KEY` is required for the chatbot functionality. If you don't have one, you can get it from [OpenAI's platform](https://platform.openai.com/api-keys).
+
+Alternatively, you can set these environment variables in your system environment before running the application.
+
 ### Database Configuration
 - `DATABASE_URL`: PostgreSQL connection string (default: postgresql://postgres:postgres@localhost:5432/uav_logger)
 - `DB_USER`: PostgreSQL username (default: postgres)

@@ -20,6 +20,7 @@ langchain-core
 langchain-community
 langchain-openai
 faiss-cpu
+langgraph==0.0.19
 
 # API and Web
 fastapi

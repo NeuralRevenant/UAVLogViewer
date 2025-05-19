@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
@@ -10,12 +10,20 @@ import asyncio
 import re  # For regex pattern matching
 
 from agents.flight_agent import FlightAgent
+from agents.react_agent import ReActAgent
 from telemetry.parser import TelemetryParser
 from telemetry.analyzer import TelemetryAnalyzer
 
 # Load environment variables
 load_dotenv()
 
+# Check if OPENAI_API_KEY is set and provide clear error if not
+if not os.getenv("OPENAI_API_KEY"):
+    print("WARNING: OPENAI_API_KEY environment variable not found! Using demo key for testing.")
+    print("For production use, please set this in your .env file or environment variables.")
+    # Set a temporary key for testing - REPLACE THIS WITH YOUR ACTUAL KEY
+    os.environ["OPENAI_API_KEY"] = "sk-1234567890abcdefghijklmnopqrstuvwxyz"
+    
 # Server configuration
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
@@ -50,6 +58,7 @@ class FlightSession(BaseModel):
     id: str
     created_at: datetime
     telemetry_data: Dict
+    agent_type: str = "react_agent"
 
 class ChatMessage(BaseModel):
     session_id: str
@@ -58,30 +67,46 @@ class ChatMessage(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     analysis: Optional[Dict[str, Any]] = None
+    thought_process: Optional[List[str]] = None
+    tools_used: Optional[List[str]] = None
 
 @app.post("/upload")
-async def upload_log(file: UploadFile = File(...)):
+async def upload_log(
+    file: UploadFile = File(...),
+    agent_type: str = Form("react_agent")  # Default to original agent for backward compatibility
+):
     try:
-        # Save file temporarily
-        file_path = f"{TEMP_UPLOAD_DIR}/{file.filename}"
-        os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+        # Validate agent type
+        if agent_type not in ["flight_agent", "react_agent"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid agent_type. Must be one of: flight_agent, react_agent"
+            )
         
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        # Create temporary file
+        file_path = f"./backend/temp/{uuid.uuid4()}_{file.filename}"
+        os.makedirs("./backend/temp", exist_ok=True)
         
+        # Write uploaded file to disk
         try:
-            # Parse telemetry data with the updated parser (returns DataFrames with only important columns)
-            print(f"Parsing telemetry data from {file.filename}...")
+            with open(file_path, "wb") as f:
+                while content := await file.read(1024 * 1024):  # Read in 1MB chunks
+                    f.write(content)
+        except Exception as e:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            print(f"ERROR writing uploaded file: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to write file: {str(e)}")
+        
+        # Process the uploaded file
+        try:
+            print(f"Processing file: {file.filename}")
             parser = TelemetryParser(file_path)
             telemetry_data = parser.parse()
+            if not telemetry_data:
+                raise ValueError("No telemetry data could be extracted from the log file.")
             
-            # Verify we have meaningful data before proceeding
-            if not telemetry_data or all(df.empty for df in telemetry_data.values()):
-                raise ValueError("No meaningful telemetry data could be extracted from the log file")
-            
-            # Create analyzer with the parsed telemetry data
-            print("Creating analyzer with parsed telemetry data...")
+            print(f"Creating telemetry analyzer...")
             analyzer = TelemetryAnalyzer(telemetry_data)
             
             # Create new flight session
@@ -91,22 +116,33 @@ async def upload_log(file: UploadFile = File(...)):
             flight_sessions[session_id] = FlightSession(
                 id=session_id,
                 created_at=datetime.now(timezone.utc),
-                telemetry_data=telemetry_data
+                telemetry_data=telemetry_data,
+                agent_type=agent_type
             )
             
-            # Create flight agent with the analyzer
-            print(f"Creating flight agent for session {session_id}...")
-            active_sessions[session_id] = FlightAgent(
-                session_id=session_id,
-                telemetry_data=telemetry_data,
-                analyzer=analyzer
-            )
+            # Create the appropriate agent type
+            print(f"Creating {agent_type} for session {session_id}...")
+            
+            if agent_type == "react_agent":
+                # Create ReAct agent
+                active_sessions[session_id] = ReActAgent(
+                    session_id=session_id,
+                    telemetry_data=telemetry_data,
+                    analyzer=analyzer
+                )
+            else:
+                # Create the original flight agent
+                active_sessions[session_id] = FlightAgent(
+                    session_id=session_id,
+                    telemetry_data=telemetry_data,
+                    analyzer=analyzer
+                )
             
             # Cleanup
             os.remove(file_path)
             
             print(f"Successfully created session {session_id} from {file.filename}")
-            return {"session_id": session_id, "message": "Log file processed successfully"}
+            return {"session_id": session_id, "message": "Log file processed successfully", "agent_type": agent_type}
         
         except Exception as processing_error:
             # If file exists but processing fails, clean up the file
@@ -143,15 +179,15 @@ async def chat(message: ChatMessage):
         raise HTTPException(status_code=404, detail="Session not found")
     
     try:
-        # Process message with flight agent with a hard timeout at API level
+        # Process message with agent with a hard timeout at API level
         try:
             # Set an overall timeout for the chat operation
             result = await asyncio.wait_for(
                 active_sessions[session_id].process_message(message.message),
-                timeout=90.0  # 90 seconds max at API level
+                timeout=40.0  # 40 seconds max at API level
             )
         except asyncio.TimeoutError:
-            print(f"ERROR: Chat endpoint timed out after 90 seconds for session {session_id}")
+            print(f"ERROR: Chat endpoint timed out after 40 seconds for session {session_id}")
             raise HTTPException(
                 status_code=504, 
                 detail="The request took too long to process. Please try a simpler query."
@@ -159,7 +195,7 @@ async def chat(message: ChatMessage):
         
         # Check if result contains an error field, which indicates a failure
         if "error" in result and result["error"]:
-            print(f"ERROR returned from flight agent: {result['error']}")
+            print(f"ERROR returned from agent: {result['error']}")
             
             # Provide the error message to the client
             raise HTTPException(
@@ -194,35 +230,35 @@ async def chat(message: ChatMessage):
             elif "altitude" in metrics_data:
                 altitude_analysis = {"statistics": metrics_data["altitude"]}
             
-                            # If we have altitude analysis, make sure it's using reasonable values
-                if altitude_analysis and "statistics" in altitude_analysis:
-                    alt_stats = altitude_analysis["statistics"]
-                    # Check if the max altitude is reasonable
-                    max_alt = alt_stats.get("max")
-                    if max_alt is not None and isinstance(max_alt, (int, float)) and max_alt > 1000:
-                        print(f"WARNING: Unreasonably high max altitude in API response: {max_alt}")
-                        # Try to apply an additional correction factor if it looks like sea level data
-                        if max_alt > 100000:  # Extremely high, might be in mm or µm
-                            alt_stats["max"] = max_alt / 1000.0
-                            print(f"Applied mm->m conversion: {alt_stats['max']}")
-                        else:
-                            # Otherwise, flag this value as suspicious
-                            alt_stats["max"] = f"Suspicious value: {max_alt}"
-                    
-                    # Verify min altitude is present
-                    min_alt = alt_stats.get("min")
-                    if min_alt is None:
-                        print(f"WARNING: Missing min altitude in API response, attempting to calculate")
-                        # If missing, try to derive from range
-                        if "range" in alt_stats and max_alt is not None and isinstance(max_alt, (int, float)):
-                            range_value = alt_stats.get("range")
-                            if isinstance(range_value, (int, float)):
-                                alt_stats["min"] = max_alt - range_value
-                                print(f"Calculated min altitude: {alt_stats['min']}")
-                    
-                    # Use the verified altitude stats
-                    metrics_data["altitude"] = alt_stats
-            
+            # If we have altitude analysis, make sure it's using reasonable values
+            if altitude_analysis and "statistics" in altitude_analysis:
+                alt_stats = altitude_analysis["statistics"]
+                # Check if the max altitude is reasonable
+                max_alt = alt_stats.get("max")
+                if max_alt is not None and isinstance(max_alt, (int, float)) and max_alt > 1000:
+                    print(f"WARNING: Unreasonably high max altitude in API response: {max_alt}")
+                    # Try to apply an additional correction factor if it looks like sea level data
+                    if max_alt > 100000:  # Extremely high, might be in mm or µm
+                        alt_stats["max"] = max_alt / 1000.0
+                        print(f"Applied mm->m conversion: {alt_stats['max']}")
+                    else:
+                        # Otherwise, flag this value as suspicious
+                        alt_stats["max"] = f"Suspicious value: {max_alt}"
+                
+                # Verify min altitude is present
+                min_alt = alt_stats.get("min")
+                if min_alt is None:
+                    print(f"WARNING: Missing min altitude in API response, attempting to calculate")
+                    # If missing, try to derive from range
+                    if "range" in alt_stats and max_alt is not None and isinstance(max_alt, (int, float)):
+                        range_value = alt_stats.get("range")
+                        if isinstance(range_value, (int, float)):
+                            alt_stats["min"] = max_alt - range_value
+                            print(f"Calculated min altitude: {alt_stats['min']}")
+                
+                # Use the verified altitude stats
+                metrics_data["altitude"] = alt_stats
+        
             # Include up to 30 metrics fields maximum to avoid overwhelming response
             field_count = 0
             pruned_metrics = {}
@@ -261,103 +297,58 @@ async def chat(message: ChatMessage):
             elif isinstance(anomalies_data, str):
                 analysis_data["anomalies"] = anomalies_data
         
-        # CRITICAL: Check LLM response for unreasonable altitude values and correct them
-        response_text = result["answer"]
+        # Extract response content based on agent type
+        session = flight_sessions.get(session_id)
+        response_text = result.get("response", result.get("answer", ""))
         
-        # Fix incorrect statements about missing altitude data
-        if "altitude" in analysis_data["metrics"] and "min" in analysis_data["metrics"]["altitude"]:
-            min_alt_value = analysis_data["metrics"]["altitude"]["min"]
-            if isinstance(min_alt_value, (int, float)):
-                min_alt_str = f"{min_alt_value:.1f}" if min_alt_value != int(min_alt_value) else f"{int(min_alt_value)}"
-                # Replace incorrect statements about min altitude not being available
-                incorrect_patterns = [
-                    r"(?:does not explicitly state|doesn't include|doesn't show|no data for|missing|unavailable) (?:the )?minimum altitude",
-                    r"minimum altitude (?:is not available|is missing|was not provided|isn't included|isn't given)",
-                    r"not (?:the|a) minimum altitude",
-                    r"without the minimum (?:altitude|value)"
-                ]
-                for pattern in incorrect_patterns:
-                    response_text = re.sub(
-                        pattern, 
-                        f"minimum altitude was {min_alt_str} m", 
-                        response_text, 
-                        flags=re.IGNORECASE
-                    )
+        # ReAct agent specific fields
+        thought_process = None
+        tools_used = None
         
-        # Look for absolute altitude values and replace them with relative values
-        altitude_patterns = [
-            r"(\d{3,})(?:\.?\d*)?(?:\s*|\-)?(?:m|meters|metre)",  # matches "644.5 meters" or "644 m"
-            r"altitude(?:.+?)(?:was|of|reached)(?:.+?)(\d{3,})(?:\.?\d*)?(?:\s*|\-)?(?:m|meters|metre)", # matches "altitude was 644.5 meters"
-            r"(?:max|maximum)(?:.+?)(?:altitude|height)(?:.+?)(\d{3,})(?:\.?\d*)?(?:\s*|\-)?(?:m|meters|metre)" # matches "max altitude of 644.5 meters"
-        ]
+        # Get agent-specific data
+        if session and session.agent_type == "react_agent":
+            # For ReAct agent, include the thought process and tools used
+            thought_process = result.get("thought_process", [])
+            tools_used = result.get("tools_used", [])
+        else:
+            # For the original flight agent, correct known issues in the response
+            # CRITICAL: Check LLM response for unreasonable altitude values and correct them
+            if "altitude" in analysis_data["metrics"] and "min" in analysis_data["metrics"]["altitude"]:
+                min_alt_value = analysis_data["metrics"]["altitude"]["min"]
+                if isinstance(min_alt_value, (int, float)):
+                    min_alt_str = f"{min_alt_value:.1f}" if min_alt_value != int(min_alt_value) else f"{int(min_alt_value)}"
+                    # Replace incorrect statements about min altitude not being available
+                    incorrect_patterns = [
+                        r"(?:does not explicitly state|doesn't include|doesn't show|no data for|missing|unavailable) (?:the )?minimum altitude",
+                        r"minimum altitude (?:is not available|is missing|was not provided|isn't included|isn't given)",
+                        r"not (?:the|a) minimum altitude",
+                        r"without the minimum (?:altitude|value)"
+                    ]
+                    for pattern in incorrect_patterns:
+                        response_text = re.sub(
+                            pattern, 
+                            f"minimum altitude was {min_alt_str} m", 
+                            response_text, 
+                            flags=re.IGNORECASE
+                        )
         
-        # Get the correct altitude value from our processed metrics
-        # Look for the most reliable altitude value from our metrics
-        correct_max_altitude = None
-        
-        # Try to get from the altitude field we trust
-        if "altitude" in analysis_data["metrics"] and "max" in analysis_data["metrics"]["altitude"]:
-            max_val = analysis_data["metrics"]["altitude"]["max"]
-            if isinstance(max_val, (int, float)) and max_val < 1000:
-                correct_max_altitude = max_val
-                
-        # If we still don't have a value, try other altitude fields
-        if correct_max_altitude is None:
-            for field_name, field_data in analysis_data["metrics"].items():
-                if ("alt" in field_name.lower() or "height" in field_name.lower()) and isinstance(field_data, dict):
-                    # Skip absolute altitude fields that mention "sea level" or "absolute"
-                    if "sea" in field_name.lower() or "absolute" in field_name.lower():
-                        continue
-                        
-                    if "max" in field_data:
-                        max_val = field_data["max"]
-                        if isinstance(max_val, (int, float)) and max_val < 1000:
-                            correct_max_altitude = max_val
-                            break
-        
-        # If we found a reasonable altitude value, use it to correct the response
-        if correct_max_altitude is not None:
-            for pattern in altitude_patterns:
-                # Find all matches in the response
-                matches = re.findall(pattern, response_text, re.IGNORECASE)
-                for match in matches:
-                    # Convert match to numeric value
-                    try:
-                        value = float(match.replace(",", ""))
-                        # Only replace if it's suspiciously high
-                        if value > 100:  # Higher than 100 meters might be suspicious 
-                            # Replace the value
-                            formatted_old = f"{value:,}" if "," in match else str(value)
-                            formatted_new = f"{correct_max_altitude:.1f}"
-                            response_text = response_text.replace(formatted_old, formatted_new)
-                            print(f"Replaced suspicious altitude {match} with {formatted_new} meters")
-                    except (ValueError, TypeError):
-                        continue  # Not a valid number, skip it
-        
-        # Return the corrected response
         return ChatResponse(
-            response=response_text,
-            analysis=analysis_data
+            response=response_text, 
+            analysis=analysis_data,
+            thought_process=thought_process,
+            tools_used=tools_used
         )
-    except HTTPException:
-        # Re-raise HTTP exceptions without wrapping
-        raise
-    except asyncio.CancelledError:
-        # Handle task cancellation explicitly
-        print(f"CANCELLED: Chat task was cancelled for session {session_id}")
-        raise HTTPException(
-            status_code=504,
-            detail="The request was cancelled due to server load or timeout."
-        )
+    
     except Exception as e:
-        print(f"ERROR in /chat endpoint: {str(e)}")
+        # Log the error with stack trace
+        print(f"ERROR in chat endpoint: {str(e)}")
         import traceback
-        print(f"CHAT ENDPOINT ERROR TRACEBACK: {traceback.format_exc()}")
+        print(f"CHAT ENDPOINT ERROR: {traceback.format_exc()}")
         
-        # Provide a specific error message
+        # Return specific error for API clients
         raise HTTPException(
             status_code=500, 
-            detail=f"Error processing chat message: {str(e)}"
+            detail=f"Chat processing failed: {str(e)}"
         )
 
 @app.get("/session/{session_id}/messages")
@@ -378,7 +369,8 @@ async def list_sessions():
             {
                 "id": session_id,
                 "created_at": session.created_at.isoformat(),
-                "has_telemetry": bool(session.telemetry_data)
+                "has_telemetry": bool(session.telemetry_data),
+                "agent_type": session.agent_type
             } for session_id, session in flight_sessions.items()
         ]
     }

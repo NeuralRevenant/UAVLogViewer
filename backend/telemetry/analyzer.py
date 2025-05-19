@@ -28,7 +28,7 @@ class AnomalyDetection:
 # -----------------------------------------------------------------------------
 class TelemetryAnalyzer:
     """Advanced analytics on telemetry data from multiple UAV platforms."""
-
+    
     # -------------------------------------------------------------------------
     def __init__(self, telemetry: Dict[str, pd.DataFrame]) -> None:
         self.telemetry = telemetry
@@ -124,7 +124,7 @@ class TelemetryAnalyzer:
             logger.warning("No timestamps found in telemetry data")
             self.time_series = {"timestamp": []}
             return
-            
+
         # Create a sorted, unique timestamp index
         master_index = sorted(set(timestamps))
         logger.info(f"Created master index with {len(master_index)} unique timestamps")
@@ -883,7 +883,7 @@ class TelemetryAnalyzer:
         bat_key = self._pick_key(["battery_remaining", "voltage_battery"])
         if bat_key:
             bat_values = np.array(self.time_series[bat_key])
-            # Calculate drain rate
+        # Calculate drain rate
             if len(bat_values) > 1:
                 drain_rate = (bat_values[0] - bat_values[-1]) / len(bat_values)
                 kpis["battery_efficiency"] = float(1.0 / (1.0 + drain_rate * 10))  # Normalize
