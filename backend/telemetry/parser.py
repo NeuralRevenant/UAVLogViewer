@@ -1,380 +1,260 @@
+"""
+UAV telemetry parser
+----------------------------------------
+
+ - MAVLink streams / DataFlash :  .tlog   .bin   .log
+ - PX4 ULog                    :  .ulg    .ulog   (needs *pyulog*)
+
+Output
+------
+dict{ message_type : pandas.DataFrame }   — each DF is indexed by a *unique*
+`timestamp` in UTC and all numeric columns are in coherent SI units.
+"""
+
+from __future__ import annotations
+from typing import Dict, List, Any, Optional
 from pymavlink import mavutil
 import pandas as pd
-import numpy as np
-import os
-import logging
-from typing import Dict, List, Any, Optional
-import time
+import numpy  as np
+import os, time, logging
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# 1.  Messages we actually need                                               #
+# --------------------------------------------------------------------------- #
+ESSENTIAL: Dict[str, List[str]] = {
+    # Navigation
+    "GLOBAL_POSITION_INT": ["time_boot_ms", "lat", "lon", "alt",
+                            "relative_alt", "vx", "vy", "vz", "hdg"],
+    "VFR_HUD":             ["airspeed", "groundspeed", "heading",
+                            "throttle", "alt", "climb"],
+    "ATTITUDE":            ["time_boot_ms", "roll", "pitch", "yaw",
+                            "rollspeed", "pitchspeed", "yawspeed"],
+
+    # Power
+    "SYS_STATUS":          ["voltage_battery", "current_battery",
+                            "battery_remaining"],
+    "BATTERY_STATUS":      ["voltages", "current_battery",
+                            "battery_remaining"],
+
+    # GPS
+    "GPS_RAW_INT":         ["time_usec", "fix_type", "lat", "lon",
+                            "alt", "eph", "epv", "satellites_visible"],
+
+    # RC / RSSI
+    "RC_CHANNELS":         ["time_boot_ms", "chan1_raw", "chan2_raw",
+                            "chan3_raw", "chan4_raw", "chan5_raw",
+                            "chan6_raw", "chan7_raw", "chan8_raw", "rssi"],
+}
+
+# --------------------------------------------------------------------------- #
+# 2.  Raw-unit  →  SI conversion factors                                      #
+# --------------------------------------------------------------------------- #
+UNIT: Dict[str, float] = {
+    # lat / lon  (1e7 → deg)
+    "GLOBAL_POSITION_INT.lat": 1e-7,
+    "GLOBAL_POSITION_INT.lon": 1e-7,
+    "GPS_RAW_INT.lat":         1e-7,
+    "GPS_RAW_INT.lon":         1e-7,
+
+    # altitudes  (mm → m)
+    "GLOBAL_POSITION_INT.alt": 1e-3,
+    "GPS_RAW_INT.alt":         1e-3,
+
+    # battery voltage (mV → V)  – other cells added at run-time
+    "SYS_STATUS.voltage_battery": 1e-3,
+
+    # current (0.01 A units → A)
+    "SYS_STATUS.current_battery":     0.01,
+    "BATTERY_STATUS.current_battery": 0.01,
+}
+
+MAX_VOLT_CELLS      = 10       # ArduCopter sends at most ten cell voltages
+SHIFT_DUPLICATES_US = 1        # shift duplicate timestamps by ±1 µs steps
+
 
 class TelemetryParser:
-    """
-    Telemetry parser that handles multiple UAV log formats.
-    
-    Supports:
-    - MAVLink telemetry logs (.tlog)
-    - ArduPilot DataFlash logs (.bin)
-    - PX4 ULog files (.ulg/.ulog) via fallback to pyulog if available
-    
-    Features:
-    - Automatic format detection
-    - Efficient extraction of mission-critical telemetry
-    - Timestamp deduplication and alignment
-    - Proper handling of unit conversions
-    - Intelligent field selection with fallbacks
-    """
-    
-    # Define critical message types and fields for efficient parsing
-    # These are the most commonly needed fields for flight analysis
-    ESSENTIAL_MESSAGES = {
-        # Position and Altitude
-        'GLOBAL_POSITION_INT': ['time_boot_ms', 'lat', 'lon', 'alt', 'relative_alt', 'vx', 'vy', 'vz', 'hdg'],
-        'LOCAL_POSITION_NED': ['time_boot_ms', 'x', 'y', 'z', 'vx', 'vy', 'vz'],
-        'ALTITUDE': ['time_usec', 'altitude_monotonic', 'altitude_amsl', 'altitude_local', 'altitude_relative', 'altitude_terrain', 'bottom_clearance'],
-        'TERRAIN_REPORT': ['lat', 'lon', 'spacing', 'terrain_height', 'current_height'],
-        'VFR_HUD': ['airspeed', 'groundspeed', 'heading', 'throttle', 'alt', 'climb'],
-        
-        # Attitude and Navigation
-        'ATTITUDE': ['time_boot_ms', 'roll', 'pitch', 'yaw', 'rollspeed', 'pitchspeed', 'yawspeed'],
-        'AHRS': ['roll', 'pitch', 'yaw', 'altitude', 'lat', 'lng'],
-        'AHRS2': ['roll', 'pitch', 'yaw', 'altitude', 'lat', 'lng'],
-        'AHRS3': ['roll', 'pitch', 'yaw', 'altitude', 'lat', 'lng'],
-        'NAV_CONTROLLER_OUTPUT': ['nav_roll', 'nav_pitch', 'alt_error', 'aspd_error', 'xtrack_error', 'nav_bearing', 'target_bearing', 'wp_dist'],
-        
-        # System Status
-        'SYS_STATUS': ['voltage_battery', 'current_battery', 'battery_remaining', 'drop_rate_comm', 'errors_comm'],
-        'BATTERY_STATUS': ['id', 'battery_function', 'type', 'temperature', 'voltages', 'current_battery', 'current_consumed', 'energy_consumed', 'battery_remaining', 'time_remaining'],
-        'POWER_STATUS': ['Vcc', 'Vservo', 'flags'],
-        'MEMINFO': ['brkval', 'freemem', 'freemem32'],
-        
-        # GPS and Satellites
-        'GPS_RAW_INT': ['time_usec', 'fix_type', 'lat', 'lon', 'alt', 'eph', 'epv', 'vel', 'cog', 'satellites_visible'],
-        'GPS2_RAW': ['time_usec', 'fix_type', 'lat', 'lon', 'alt', 'eph', 'epv', 'vel', 'cog', 'satellites_visible'],
-        'GPS_STATUS': ['satellites_visible', 'satellite_prn', 'satellite_used', 'satellite_elevation', 'satellite_azimuth', 'satellite_snr'],
-        
-        # Mode and Commands
-        'HEARTBEAT': ['type', 'autopilot', 'base_mode', 'custom_mode', 'system_status', 'mavlink_version'],
-        'COMMAND_ACK': ['command', 'result', 'progress', 'result_param2', 'target_system', 'target_component'],
-        'STATUSTEXT': ['severity', 'text'],
-        'MISSION_CURRENT': ['seq', 'total', 'mission_state', 'mission_mode'],
-        
-        # Control and Motors
-        'SERVO_OUTPUT_RAW': ['time_usec', 'port', 'servo1_raw', 'servo2_raw', 'servo3_raw', 'servo4_raw', 'servo5_raw', 'servo6_raw', 'servo7_raw', 'servo8_raw'],
-        'RC_CHANNELS': ['time_boot_ms', 'chan1_raw', 'chan2_raw', 'chan3_raw', 'chan4_raw', 'chan5_raw', 'chan6_raw', 'chan7_raw', 'chan8_raw', 'chan9_raw', 'chan10_raw', 'chan11_raw', 'chan12_raw', 'chan13_raw', 'chan14_raw', 'chan15_raw', 'chan16_raw', 'chan17_raw', 'chan18_raw', 'rssi'],
-        'ESC_TELEMETRY_1_TO_4': ['temperature', 'voltage', 'current', 'totalcurrent', 'rpm', 'count'],
-    }
-    
-    # Field translations and alternates for when primary fields aren't available
-    FIELD_ALTERNATES = {
-        'altitude': [
-            'GLOBAL_POSITION_INT.relative_alt',   # First choice (mm)
-            'VFR_HUD.alt',                        # Second choice (m)
-            'ALTITUDE.altitude_relative',         # Third choice (m)
-            'TERRAIN_REPORT.current_height',      # Fourth choice (m)
-            'AHRS.altitude',                      # Fifth choice (units vary)
-            'AHRS2.altitude',                     # Sixth choice
-        ],
-        'battery_voltage': [
-            'BATTERY_STATUS.voltages[0]',
-            'SYS_STATUS.voltage_battery',
-            'POWER_STATUS.Vcc',
-        ],
-        'battery_current': [
-            'BATTERY_STATUS.current_battery',
-            'SYS_STATUS.current_battery',
-        ],
-        'battery_remaining': [
-            'BATTERY_STATUS.battery_remaining',
-            'SYS_STATUS.battery_remaining',
-        ],
-        'gps_fix': [
-            'GPS_RAW_INT.fix_type',
-            'GPS2_RAW.fix_type',
-        ],
-    }
-    
-    # Units conversion factors for different fields
-    UNIT_CONVERSIONS = {
-        'GLOBAL_POSITION_INT.lat': 1e-7,        # Convert from 1e7 degrees to degrees
-        'GLOBAL_POSITION_INT.lon': 1e-7,        # Convert from 1e7 degrees to degrees
-        # 'GLOBAL_POSITION_INT.relative_alt': 1e-3, # Convert from mm to m
-        'GLOBAL_POSITION_INT.alt': 1e-3,        # Convert from mm to m
-        'GPS_RAW_INT.lat': 1e-7,                # Convert from 1e7 degrees to degrees
-        'GPS_RAW_INT.lon': 1e-7,                # Convert from 1e7 degrees to degrees
-        'GPS_RAW_INT.alt': 1e-3,                # Convert from mm to m
-        'GPS2_RAW.lat': 1e-7,                   # Convert from 1e7 degrees to degrees
-        'GPS2_RAW.lon': 1e-7,                   # Convert from 1e7 degrees to degrees
-        'GPS2_RAW.alt': 1e-3,                   # Convert from mm to m
-    }
+    # ------------------------------------------------------------------- #
+    def __init__(self, file_path: str) -> None:
+        self.fp  = file_path
+        self.ext = os.path.splitext(file_path)[1].lower()
+        if self.ext not in (".tlog", ".bin", ".log", ".ulg", ".ulog"):
+            raise ValueError("Supported: .tlog  .bin  .log  .ulg  .ulog")
 
-    def __init__(self, file_path: str):
-        """Initialise the telemetry parser and basic runtime caches."""
-        self.file_path        = file_path
-        self.file_extension   = os.path.splitext(file_path)[1].lower()
-        self.use_pyulog       = False
-
-        # ── runtime caches needed by downstream helpers ──────────────────────
-        # (analyser & exporter expect these to exist)
-        self.cache:        Dict[str, Any]  = {}
-        self.time_series:  Dict[str, List] = {}
-
-        # ── format sanity check ──────────────────────────────────────────────
-        if self.file_extension not in ('.tlog', '.bin', '.log', '.ulg', '.ulog'):
-            raise ValueError(
-                f"Unsupported file format: {self.file_extension}. "
-                "Supported: .tlog, .bin, .log, .ulg, .ulog"
-            )
-
-        # PX4 ULog → try pyulog first
-        if self.file_extension in ('.ulg', '.ulog'):
+        self.is_ulog = self.ext in (".ulg", ".ulog")
+        if self.is_ulog:
             try:
-                self.use_pyulog = True
-                logger.info("Using pyulog parser for ULog file")
-            except ImportError:
-                logger.warning("pyulog not available – falling back to pymavlink")
+                import pyulog    # noqa: F401
+            except ImportError as e:
+                raise ImportError("*.ulg parsing needs the *pyulog* package") from e
 
-        logger.info(f"Initialized parser for {file_path}")
-
+    # ------------------------------------------------------------------- #
+    # Public entry-point                                                  #
+    # ------------------------------------------------------------------- #
     def parse(self) -> Dict[str, pd.DataFrame]:
-        """Parse the telemetry log and return a dictionary of DataFrames for each message type."""
-        start_time = time.time()
-        logger.info(f"Starting to parse {self.file_path}")
-        
-        # Use appropriate parser based on file format
-        if self.use_pyulog:
-            data = self._parse_ulog()
-        else:
-            data = self._parse_mavlink()
-            
-        # Process telemetry data
-        processed_data = self._process_dataframes(data)
-        
-        # Measure and log performance
-        elapsed = time.time() - start_time
-        total_rows = sum(len(df) for df in processed_data.values())
-        logger.info(f"Parsing completed in {elapsed:.2f}s. Extracted {len(processed_data)} message types with {total_rows} total data points")
-        
-        return processed_data
+        t0   = time.time()
+        raw  = self._read_ulog() if self.is_ulog else self._read_mavlink()
+        dfs  = self._to_dataframes(raw)
+        rows = sum(len(df) for df in dfs.values())
+        log.info("✓ parsed %d msg-types – %d rows – %.2fs",
+                 len(dfs), rows, time.time() - t0)
+        return dfs
 
-
-    def _parse_mavlink(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Parse MAVLink-based logs (.tlog / .bin) and attach sane UTC timestamps."""
-        try:
-            # Use the common dialect so we get `time_boot_ms`, `time_usec`, … fields
-            mlog = mavutil.mavlink_connection(self.file_path, dialect="common")
-        except Exception as e:
-            logger.error(f"Could not open MAVLink log: {e}")
-            raise
+    # ------------------------------------------------------------------- #
+    # 3.  MAVLink / DataFlash reader (.tlog / .bin / .log)                #
+    # ------------------------------------------------------------------- #
+    def _read_mavlink(self) -> Dict[str, List[Dict[str, Any]]]:
+        mlog = mavutil.mavlink_connection(self.fp, dialect="common")
 
         data: Dict[str, List[Dict[str, Any]]] = {}
-        msg_count = 0
+        utc_anchor: Optional[float] = None   # first trusted wall-clock
+        boot_off : Optional[float] = None   # continuously refined wall − boot
 
-        msg_types_to_extract = list(self.ESSENTIAL_MESSAGES.keys())
-
-        # ──  Runtime bookkeeping ────────────────────────────────────────────────
-        wall_time_anchor: Optional[float] = None     # first definitely-UTC timestamp
-        boot_time_offset: Optional[float] = None     # seconds to convert boot-time→UTC
+        wanted = list(ESSENTIAL.keys())
 
         while True:
-            msg = mlog.recv_match(type=msg_types_to_extract, blocking=False)
-            if msg is None:                       # EOF
+            msg = mlog.recv_match(type=wanted, blocking=False)
+            if msg is None:
                 break
 
-            mtype = msg.get_type()
-            if mtype not in self.ESSENTIAL_MESSAGES:
-                continue
+            kind = msg.get_type()
+            d    = msg.to_dict()
 
-            try:
-                mdict = msg.to_dict()             # raw field → value mapping
+            # ---- raw clocks -------------------------------------------
+            wall = getattr(msg, "_timestamp", None)
+            wall = float(wall) if wall and wall > 1e9 else None  # sanity guard
 
-                # --------------------------------------------------------------- 
-                # Work out an absolute timestamp for this message
-                # ---------------------------------------------------------------
-                # native wall-clock timestamp provided by pymavlink
-                native_ts = getattr(msg, "_timestamp", None)
-                if native_ts and native_ts > 1_000_000_000:   # ≈ 2001-09-09
-                    wall = float(native_ts)
-                    if wall_time_anchor is None:
-                        wall_time_anchor = wall
-                else:
-                    wall = None
+            boot = d.get("time_boot_ms")
+            if boot is not None:
+                boot /= 1e3
+            elif "time_usec" in d:
+                boot = d["time_usec"] / 1e6
+            else:
+                boot = None
 
-                # Vehicle’s time-since-boot (preferred if we know the offset)
-                if hasattr(msg, "time_boot_ms"):
-                    boot = msg.time_boot_ms / 1000.0
-                elif "time_usec" in mdict:
-                    boot = mdict["time_usec"] / 1e6
-                else:
-                    boot = None
+            if wall and not utc_anchor:
+                utc_anchor = wall
+            if wall and boot is not None:
+                boot_off = wall - boot        # refine whenever possible
 
-                if boot is not None:
-                    # First time we see both kinds → fix the offset
-                    if boot_time_offset is None and wall is not None:
-                        boot_time_offset = wall - boot
-                    if boot_time_offset is not None:
-                        wall = boot_time_offset + boot
+            ts = boot + boot_off if (boot is not None and boot_off is not None) else \
+                 wall or utc_anchor or 0.0
 
-                # Still nothing?  Fallback to anchor or 0
-                if wall is None:
-                    wall = wall_time_anchor if wall_time_anchor else 0.0
+            d["timestamp"] = pd.to_datetime(ts, unit="s", utc=True)
+            data.setdefault(kind, []).append(d)
 
-                # Final pandas UTC timestamp
-                mdict["timestamp"] = pd.to_datetime(wall, unit="s", utc=True)
-
-                # ---------------------------------------------------------
-                # Collect message
-                # ------------------------------------------------------------
-                data.setdefault(mtype, []).append(mdict)
-                msg_count += 1
-                if msg_count % 100_000 == 0:
-                    logger.info(f"Parsed {msg_count:,} messages…")
-
-            except Exception as e:
-                logger.warning(f"Skipping corrupt {mtype} message: {e}")
-                continue
-
-        logger.info(f"Finished: {msg_count:,} messages from {len(data)} types")
+        mlog.close()
         return data
 
-    
-    def _parse_ulog(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Parse PX4 ULog files using pyulog."""
-        try:
-            import pyulog
-            from pyulog.core import ULog
-            
-            # Parse the ULog file
-            ulog = ULog(self.file_path)
-            
-            # Convert ULog data to our expected format
-            data: Dict[str, List[Dict[str, Any]]] = {}
-            
-            # Map PX4 topics to MAVLink message types where possible
-            topic_mapping = {
-                'vehicle_local_position': 'LOCAL_POSITION_NED',
-                'vehicle_global_position': 'GLOBAL_POSITION_INT',
-                'vehicle_attitude': 'ATTITUDE', 
-                'vehicle_status': 'HEARTBEAT',
-                'battery_status': 'BATTERY_STATUS',
-                'vehicle_gps_position': 'GPS_RAW_INT',
-                'actuator_outputs': 'SERVO_OUTPUT_RAW',
-                'vehicle_air_data': 'VFR_HUD',
-            }
-            
-            # Process each data item in the ULog
-            for d in ulog.data_list:
-                topic_name = d.name
-                
-                # Map PX4 topic to MAVLink message type if possible
-                msg_type = topic_mapping.get(topic_name, topic_name)
-                
-                # Convert timestamps to datetime
-                timestamps = pd.to_datetime(d.data['timestamp'], unit='us')
-                
-                # Process each row of data
-                rows = []
-                for i in range(len(timestamps)):
-                    row = {field: d.data[field][i] for field in d.data.keys() if field != 'timestamp'}
-                    row['timestamp'] = timestamps[i]
-                    rows.append(row)
-                
-                # Store the data
-                data[msg_type] = rows
-                
-            return data
-            
-        except ImportError:
-            logger.error("pyulog is required to parse ULog files. Please install it with: pip install pyulog")
-            raise
-        except Exception as e:
-            logger.error(f"Error parsing ULog file: {str(e)}")
-            raise
+    # ------------------------------------------------------------------- #
+    # 4.  PX4 ULog reader (.ulg / .ulog)                                  #
+    # ------------------------------------------------------------------- #
+    def _read_ulog(self) -> Dict[str, List[Dict[str, Any]]]:
+        from pyulog import ULog
+        u = ULog(self.fp)
 
-
-    def _process_dataframes(
-        self,
-        data: Dict[str, List[Dict[str, Any]]]
-    ) -> Dict[str, pd.DataFrame]:
-        """
-        Build clean per-message DataFrames, apply unit fixes, then assemble the
-        wide time-series table.  Results are stored in `self.time_series` and
-        a copy of the wide DataFrame is cached in `self.cache['wide_df']`.
-        """
-        # make sure the cache exists even when __init__ was bypassed
-        if not hasattr(self, "cache"):
-            self.cache = {}
-        processed: Dict[str, pd.DataFrame] = {}
-
-        for mtype, msgs in data.items():
-            if not msgs:
-                continue
-            try:
-                df = pd.DataFrame(msgs)
-
-                # ── timestamp clean-up ─────────────────────────────────────────
-                if "timestamp" in df.columns:
-                    if not df["timestamp"].is_unique:               # micro-offset dups
-                        dup = df.groupby("timestamp").cumcount()
-                        df["timestamp"] += pd.to_timedelta(dup, unit="us")
-
-                    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.round("10ms")
-                    df = (
-                        df.set_index("timestamp")
-                        .groupby(level=0)
-                        .mean(numeric_only=True)
-                        .sort_index()
-                    )
-
-                # ── explicit unit conversions ─────────────────────────────────
-                for col in df.columns:
-                    key = f"{mtype}.{col}"
-                    if key in self.UNIT_CONVERSIONS:
-                        df[col] = df[col] * self.UNIT_CONVERSIONS[key]
-
-                # ── expand list-type fields (e.g. BATTERY_STATUS.voltages) ────
-                for col in list(df.columns):
-                    if len(df) and isinstance(df[col].iloc[0], list):
-                        df[f"{col}_sum"] = df[col].apply(
-                            lambda x: float(np.sum(x)) if x else np.nan
-                        )
-                        df[f"{col}[0]"] = df[col].apply(
-                            lambda x: x[0] if x else np.nan
-                        )
-
-                processed[mtype] = df
-
-            except Exception as e:
-                logger.warning(f"Failed to process {mtype}: {e}")
-
-        # ── assemble wide table ───────────────────────────────────────────────
-        if not processed:
-            self.time_series = {"timestamp": []}
-            return processed
-
-        wide = pd.concat(processed, axis=1, join="outer")
-
-        if not wide.index.is_unique:
-            wide = wide.groupby(level=0).mean()
-
-        wide = (
-            wide.sort_index()
-                .ffill(limit=5)
-                .bfill(limit=5)
-                .fillna(0)
-        )
-
-        self.time_series = {
-            "timestamp": wide.index.to_list(),
-            **{c: wide[c].astype("float32").to_list() for c in wide.columns},
+        data: Dict[str, List[Dict[str, Any]]] = {}
+        topics = {
+            "vehicle_local_position":  "GLOBAL_POSITION_INT",
+            "vehicle_global_position": "GLOBAL_POSITION_INT",
+            "vehicle_attitude":        "ATTITUDE",
+            "battery_status":          "BATTERY_STATUS",
+            "vehicle_gps_position":    "GPS_RAW_INT",
+            "actuator_outputs":        "RC_CHANNELS",
+            "vehicle_air_data":        "VFR_HUD",
         }
-        self.cache["wide_df"] = wide
-        return processed
+
+        for d in u.data_list:
+            mtype = topics.get(d.name)
+            if mtype not in ESSENTIAL:
+                continue
+
+            boot_usec = d.data["timestamp"]
+            if not len(boot_usec):
+                continue
+
+            boot0  = boot_usec[0] / 1e6
+            wall0  = u.start_timestamp / 1e6
+            offset = wall0 - boot0          # wall − boot  (same logic as MAVLink)
+
+            rows = []
+            for i in range(len(boot_usec)):
+                row = {f: d.data[f][i] for f in d.field_names if f != "timestamp"}
+                ts  = (boot_usec[i] / 1e6) + offset
+                row["timestamp"] = pd.to_datetime(ts, unit="s", utc=True)
+                rows.append(row)
+
+            data.setdefault(mtype, []).extend(rows)
+
+        return data
+
+    # ------------------------------------------------------------------- #
+    # 5.  Raw dicts → tidy DataFrames                                     #
+    # ------------------------------------------------------------------- #
+    def _to_dataframes(self, raw: Dict[str, List[Dict[str, Any]]]
+                       ) -> Dict[str, pd.DataFrame]:
+
+        dfs: Dict[str, pd.DataFrame] = {}
+        for mtype, rows in raw.items():
+            if not rows:
+                continue
+
+            df = pd.DataFrame(rows).set_index("timestamp", drop=True).sort_index()
+
+            # -- duplicate timestamps → shift by ±1 μs so NOTHING is lost --
+            if not df.index.is_unique:
+                dup = df.groupby(level=0).cumcount()
+                df.index = df.index + pd.to_timedelta(dup * SHIFT_DUPLICATES_US, "us")
+
+            # -- expand BATTERY_STATUS.voltages[N] ------------------------
+            for col in list(df.columns):
+                if isinstance(df[col].iloc[0], list):
+                    max_len = min(df[col].map(len).max(), MAX_VOLT_CELLS)
+                    for i in range(max_len):
+                        new = f"{col}[{i}]"
+                        df[new] = df[col].apply(
+                            lambda lst: np.nan
+                            if not lst or lst[i] in (0, 65535)
+                            else lst[i]
+                        )
+                        UNIT.setdefault(new.replace(":", "."), 1e-3)  # add SI factor
+                    df.drop(columns=col, inplace=True)
+
+            # -- gentle gap-fill (numeric only, max 50 samples) -----------
+            if mtype not in ("GLOBAL_POSITION_INT", "GPS_RAW_INT"):
+                df = df.ffill(limit=50)
+
+            # -- apply SI conversions ------------------------------------
+            for col in df.columns:
+                factor = UNIT.get(f"{mtype}.{col}")
+                if factor:
+                    df[col] = df[col] * factor
+
+            # basic GPS sanity guard
+            if mtype in ("GLOBAL_POSITION_INT", "GPS_RAW_INT"):
+                df.loc[(df["lat"].abs() > 90) | (df["lon"].abs() > 180), :] = np.nan
+                if "alt" in df.columns:
+                    df.loc[df["alt"].abs() > 1e5, "alt"] = np.nan
+
+            # co-locate GPS_RAW_INT with GLOBAL_POSITION_INT ≫
+            if mtype in ("GLOBAL_POSITION_INT", "GPS_RAW_INT"):
+                # resample onto a 10 ms grid so the two GPS streams line up
+                df = (
+                    df.resample("10ms")
+                    .mean(numeric_only=True) # only average numeric columns
+                    .ffill(limit=20)    # allow up to 200 ms of forward‐fill
+                )
+
+            dfs[mtype] = df.astype("float32", errors="ignore")
+
+        return dfs
 
 
-# Example usage
-# parser = TelemetryParser("flight_log.tlog")
+# -----------------------------------------------------------------------------
+# Example
+# -----------------------------------------------------------------------------
+# parser = TelemetryParser("flight_log.tlog") # .tlog / .bin / .log / .ulg / .ulog
 # telemetry_data = parser.parse()
-# analyzer = TelemetryAnalyzer(telemetry_data)  # Pass to analyzer for further processing
+# analyzer = TelemetryAnalyzer(telemetry_data)

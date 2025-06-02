@@ -694,9 +694,9 @@ class TelemetryAnalyzer:
                 return 2 * R * np.arcsin(np.sqrt(a))
 
             seg_km = hav_km(lat_g[:-1], lon_g[:-1], lat_g[1:], lon_g[1:])
-            dt_sec = (ts_g[1:] - ts_g[:-1]) / np.timedelta64(1, "s")
+            # dt_sec = (ts_g[1:] - ts_g[:-1]) / np.timedelta64(1, "s")
             vmax   = 120.0
-            seg_km[(dt_sec <= 0) | ((seg_km * 1000 / dt_sec) > vmax)] = 0.0
+            # seg_km[(dt_sec <= 0) | ((seg_km * 1000 / dt_sec) > vmax)] = 0.0
 
             result["position"] = {
                 "start_lat": float(lat_g[0]),
