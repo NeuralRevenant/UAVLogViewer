@@ -50,7 +50,7 @@ class EnhancedMemoryManager:
 
     • ConversationBufferWindowMemory  (last 8 messages verbatim)
     • VectorStoreRetrieverMemory      (FAISS HNSW, time-weighted)
-    • ConversationEntityMemory        (optional entity tracking)
+    • ConversationEntityMemory        (entity tracking)
     """
 
     SHORT_WINDOW = 8        # last N messages kept verbatim
