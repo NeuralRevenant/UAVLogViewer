@@ -7,7 +7,7 @@ This is a Javascript-based log viewer for MAVLink telemetry and dataflash logs w
 
 **Agentic Chatbot Backend Demo Video**: [Link](https://drive.google.com/file/d/1f1Fz9QSIR2i6Q-iaWyDqM0kguaa5FLgX/view?usp=sharing)
 
-- You can checkout the **Readme** file in the '**backend**' directory.
+- You can checkout the **Readme** file in the '**backend**' directory - [Link](https://github.com/NeuralRevenant/UAVLogViewer/blob/master/backend/README.md)
 
 ## ✨ New Features
 
