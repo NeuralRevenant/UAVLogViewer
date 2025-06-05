@@ -86,8 +86,12 @@ INT_ROUTE_PROMPT = textwrap.dedent(
     """
     You are the **Routing / Planner** module for an agentic UAV-telemetry assistant.
 
+    You receive:
+      • User’s original question
+      • Chat history from memory
+
     ## TASK
-    1. Read the *User Query*.
+    1. Read the *User Query* and the *Chat history*. Users may ask follow-up questions like 'Is there anything wrong?' after the initial question which you should infer from the chat history.
     2. THINK ➔ PLAN ➔ EXECUTE silently (ReAct style) in your private scratch-pad.
     3. Output **ONLY** valid JSON with the following keys:
     {
@@ -95,6 +99,7 @@ INT_ROUTE_PROMPT = textwrap.dedent(
         "follow_up": "<question or null>",
         "tools": [<tool1>, <tool2>, ...]
     }
+    4. In cases where the users ask follow-up questions like 'Is there anything wrong?' and the data is already available in the chat history and no tool calls are needed, you should set the `clarification_needed` to "YES" and the `follow_up` which your analysis of the data to return a quick answer to the user.
 
     The tools list **may be empty**.
 
@@ -184,13 +189,33 @@ INT_ROUTE_PROMPT = textwrap.dedent(
     {"clarification_needed":"NO","follow_up":null,"tools":["rc_signal_details"]}
     ------------------------------------
 
-    Example 7:
+    Example 7a (Clarification is not needed as the data is already available and no tool calls needed as well - just analysis would suffice filling the 'follow_up' field with the analysis results):
     User → Is there anything wrong?
 
-    THINK  Too vague – cannot know which subsystem to inspect.
-    PLAN   Ask a clarifying question, no tools yet.
-    EXECUTE
+    Chat History →
+    User: GPS signal loss?
+    Assistant: Sure, I’ll inspect the GPS loss details.
 
+    THINK
+    The user has already asked about GPS signal loss. The latest message ("Is there anything wrong?") is a follow-up seeking detailed analysis results. The context points to any issues in the GPS data.
+
+    PLAN
+    Analyze the recent section of the GPS log and tool results for GPS signal issues instead of calling the GPS signal tool again.
+
+    EXECUTE
+    Assistant → {"clarification_needed":"YES","follow_up":"Based on my observation and analysis, there was a GPS signal loss of 1 time during the flight...","tools":[]}
+    ---------------------------------------
+
+    Example 7b (Clarification needed as no context/chat-history is available):
+    User → Is there anything wrong?
+
+    THINK
+    The question is too general to determine what subsystem or behavior the user is referring to. There’s no prior context or chat history. Without additional input, I cannot infer what to inspect (e.g., telemetry anomalies, battery, GPS, attitude).
+
+    PLAN 
+    Ask a clarifying question to determine which aspect of the flight or telemetry the user wants analyzed. Do not invoke tools yet.
+
+    EXECUTE
     Assistant →
     {"clarification_needed":"YES","follow_up":"Could you specify which aspect of the flight you’d like me to examine – battery, altitude stability, GPS accuracy, or something else?","tools":[]}
     ---------------------------------------
@@ -1246,6 +1271,46 @@ class UavAgent:
                 "session_id": self.session_id,
             }
         )
+
+
+    # async def process_message_streaming(self, message: str):
+    #     """
+    #     Run the LangGraph once, stop *right before* the synthesis node,
+    #     then stream tokens from the existing `_synthesize_streaming` generator.
+    #     """
+
+    #     # 0) Build the initial agent state exactly the same way the HTTP path does
+    #     init_state: AgentState = {
+    #         "input": message,
+    #         "session_id": self.session_id,
+    #         "scratch": {"tool_history": []},
+    #         "current_step": 0,
+    #         "errors": [],
+    #     }
+
+    #     # Letting LangGraph drive until it arrives at the "synthesize" node
+    #     #    – OR – exits earlier (e.g. ask_clarification -> END).
+    #     until_state: AgentState = await self.graph.ainvoke(
+    #         init_state,
+    #         # stop when the next node would be "synthesize";
+    #         # if the plan never reaches that node, the run just finishes.
+    #         until="synthesize",
+    #     )
+
+    #     # If the plan ended earlier (ask_clarification path) we already have an answer
+    #     if until_state.get("answer"):
+    #         yield {
+    #             "type": "complete",
+    #             "content": until_state["answer"],
+    #             "analysis": self._format_analysis(until_state),
+    #             "session_id": self.session_id,
+    #         }
+    #         return
+
+    #     # Otherwise stream the answer tokens from your existing generator
+    #     async for token in self._synthesize_streaming(until_state):
+    #         yield token
+
 
     async def process_message_streaming(self, message: str):
         """
