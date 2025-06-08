@@ -694,9 +694,9 @@ class TelemetryAnalyzer:
                 return 2 * R * np.arcsin(np.sqrt(a))
 
             seg_km = hav_km(lat_g[:-1], lon_g[:-1], lat_g[1:], lon_g[1:])
-            dt_sec = (ts_g[1:] - ts_g[:-1]) / np.timedelta64(1, "s")
-            vmax   = 120.0
-            seg_km[(dt_sec <= 0) | ((seg_km * 1000 / dt_sec) > vmax)] = 0.0
+            # dt_sec = (ts_g[1:] - ts_g[:-1]) / np.timedelta64(1, "s")
+            # vmax   = 120.0
+            # seg_km[(dt_sec <= 0) | ((seg_km * 1000 / dt_sec) > vmax)] = 0.0
 
             result["position"] = {
                 "start_lat": float(lat_g[0]),
@@ -715,15 +715,20 @@ class TelemetryAnalyzer:
     def _analyze_rc_signal(self) -> Dict[str, Any]:
         """
         Analyse RC-link quality and detect signal-loss events.
-        If no usable RC data is present → {"error": "..."}.
+        Returns {"error": "..."} if no usable data.
         """
         result: Dict[str, Any] = {"fields_used": []}
 
-        # Determine link-OK / link-lost for every sample
+        # -- timestamps as np array once ------------------------------------------
+        ts_all = np.array(self.time_series["timestamp"], dtype="datetime64[ns]")
+
+        # -------------------------------------------------------------------------
+        # 1)  Build link_ok (1 = signal present, 0 = lost)
+        # -------------------------------------------------------------------------
         link_ok: Optional[np.ndarray] = None
 
-        # Preferred source: RSSI (% or 0-255)
-        rssi_key = self._pick_key(["rssi"])
+        # Preferred: RSSI
+        rssi_key = self._pick_key(["rssi", "_rssi", "linkquality"])
         if rssi_key:
             result["fields_used"].append(rssi_key)
             rssi_raw = np.asarray(self.time_series[rssi_key], dtype=float)
@@ -749,34 +754,53 @@ class TelemetryAnalyzer:
                 link_ok = np.zeros(ts_len, dtype=int)
                 for k in chan_keys:
                     vals = np.asarray(self.time_series[k], dtype=float)
-                    link_ok = link_ok | (vals > 900.0).astype(int)    # any pulse >900 µs → link OK
+                    link_ok |= (vals > 900.0).astype(int)      # any pulse > 900 µs → link OK
 
-                result["rssi"] = None
+            result["rssi"] = None
 
-        # If we still have no data, bail out
+        # -------------------------------------------------------------------------
+        # Bail out if nothing usable
+        # -------------------------------------------------------------------------
         if link_ok is None or link_ok.size == 0:
             return {"error": "No RC signal or RSSI data in telemetry."}
 
-        # Build transitions & basic counters
+        # -------------------------------------------------------------------------
+        # 2)  Debounce ultra-short glitches  (<200 ms)  ← NEW
+        # -------------------------------------------------------------------------
+        if link_ok.size > 1:                                       # need ≥2 samples
+            sample_dt = float(np.median(np.diff(ts_all)) /
+                            np.timedelta64(1, "s")) or 0.1       # seconds
+            min_loss_samples = int(round(0.20 / sample_dt))        # 200 ms
+            if min_loss_samples > 1:
+                lost = (link_ok == 0)
+                edges = np.flatnonzero(np.diff(np.r_[0, lost, 0]))
+                starts, ends = edges[::2], edges[1::2]
+                for s, e in zip(starts, ends):
+                    if (e - s) < min_loss_samples:
+                        link_ok[s:e] = 1                           # treat as OK
+
+        # -------------------------------------------------------------------------
+        # 3)  Build transitions & summary
+        # -------------------------------------------------------------------------
         loss_samples, transitions = self._rc__build_transitions(link_ok.astype(bool))
-        result["rc_signal_transitions"] = transitions[:10]
+        result["rc_signal_transitions"]   = transitions[:10]        # cap list length
         result["rc_signal_zero_samples"]  = loss_samples
 
         # Higher-level dropout statistics
         dropout_events = [tr for tr in transitions if tr["to"] == 0]
-        result["rc_signal_loss_count"] = len(dropout_events)
-        result["rc_signal_dropouts"] = len(dropout_events)
-        result["rc_signal_first_loss_time"] = dropout_events[0]["time"] if dropout_events else None
+        result["rc_signal_loss_count"]         = len(dropout_events)
+        result["rc_signal_dropouts"]           = len(dropout_events)
+        result["rc_signal_first_loss_time"]    = dropout_events[0]["time"] if dropout_events else None
 
-        # longest continuous lost streak
-        ts = np.array(self.time_series["timestamp"], dtype="datetime64[ns]")
+        # Longest continuous lost streak
         lost = (link_ok == 0)
         if lost.any():
             padded = np.r_[0, lost.astype(int), 0]
             diffs  = np.diff(padded)
             starts = np.where(diffs == 1)[0]
             ends   = np.where(diffs == -1)[0]
-            durations = ((ts[ends - 1] - ts[starts]) / np.timedelta64(1, "s")).astype(float)
+            durations = ((ts_all[ends - 1] - ts_all[starts]) /
+                        np.timedelta64(1, "s")).astype(float)
             result["rc_signal_longest_loss_duration_sec"] = float(durations.max()) if durations.size else 0.0
         else:
             result["rc_signal_longest_loss_duration_sec"] = 0.0
